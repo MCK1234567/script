@@ -1,0 +1,9 @@
+loadstring(game:HttpGet("https://raw.githubusercontent.com/MCK1234567/script/refs/heads/main/lockfps"))()
+
+loadstring(game:HttpGet(" https://pastebin.com/raw/8YPmiRRd"))()
+
+loadstring(game:HttpGet("https://raw.githubusercontent.com/Chris12089/atlasbss/main/script.lua"))()
+
+loadstring(game:HttpGet("https://raw.githubusercontent.com/MCK1234567/script/refs/heads/main/optimizermod_v3_autostart"))() 
+
+loadstring(game:HttpGet("https://pastebin.com/raw/QHJAbX2A"))()
