@@ -1,0 +1,39 @@
+-- :]
+
+local TARGET_FPS = 15
+local UserInputService = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+local gui = Instance.new("ScreenGui")
+gui.ResetOnS* = false
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local label = Instance.new("TextLabel")
+label.Size = UDim2.new(0, 200, 0, 50)
+label.Position = UDim2.new(0.5, -100, 0, 10)
+label.BackgroundTransparency = 1
+label.TextScaled = true
+label.Font = Enum.Font.SourceSansBold
+label.Parent = gui
+
+local isOn = true
+setfpscap(TARGET_FPS)
+label.Text = "FPS Limiter: ON"
+label.TextColor3 = Color3.new(0, 1, 0)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if input.KeyCode == Enum.KeyCode.J then
+		isOn = not isOn
+		if isOn then
+			setfpscap(TARGET_FPS)
+			label.Text = "FPS Limiter: ON"
+			label.TextColor3 = Color3.new(0, 1, 0)
+		else
+			setfpscap(0)
+			label.Text = "FPS Limiter: OFF"
+			label.TextColor3 = Color3.new(1, 0, 0)
+		end
+	end
+end)
