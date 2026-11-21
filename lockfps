@@ -1,5 +1,5 @@
 if setfpscap then
-    setfpscap(20) -- Change this value to your desired FPS
+    setfpscap(15) -- Change this value to your desired FPS
 else
     warn("Executor does not support setfpscap!")
 end
