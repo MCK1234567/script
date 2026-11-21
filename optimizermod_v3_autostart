@@ -1,0 +1,1544 @@
+--==============================================================
+-- ROBLOX SUPER OPTIMIZER V3.0
+-- Event-driven | Time-sliced | Restore-safe | Auto-start, module luôn bật
+-- Chỉ dùng API Roblox chính thức. KHÔNG dùng API riêng của Executor.
+-- (Duy nhất: bảng `shared` để chống nạp trùng - là global chuẩn của Roblox)
+-- Chưa được benchmark thực tế: không tuyên bố ZERO LAG / SUPER PERFORMANCE.
+--==============================================================
+
+local Players = game:GetService("Players")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Stats = game:GetService("Stats")
+
+--==============================================================
+-- 0. CHỐNG NẠP TRÙNG + CHỜ LOCALPLAYER
+--==============================================================
+do
+	local ok, old = pcall(function() return shared.RobloxSuperOptimizer end)
+	if ok and type(old) == "table" and type(old.Unload) == "function" then
+		pcall(old.Unload)
+	end
+end
+
+local Player = Players.LocalPlayer
+if not Player then
+	local started = os.clock()
+	repeat
+		task.wait(0.25)
+		Player = Players.LocalPlayer
+	until Player or os.clock() - started > 10
+end
+if not Player then
+	warn("[SuperOptimizer V3.0] Không tìm thấy LocalPlayer.")
+	return
+end
+
+local PlayerGui = Player:WaitForChild("PlayerGui", 10)
+if not PlayerGui then
+	warn("[SuperOptimizer V3.0] Không tìm thấy PlayerGui.")
+	return
+end
+
+for _, name in ipairs({ "SuperOptimizerV21", "SuperOptimizerV22", "SuperOptimizerV30" }) do
+	local oldGui = PlayerGui:FindFirstChild(name)
+	if oldGui then pcall(function() oldGui:Destroy() end) end
+end
+
+--==============================================================
+-- 1. CẤU HÌNH
+--==============================================================
+local EFFECT_BASES = { "ParticleEmitter", "Trail", "Beam", "Fire", "Smoke", "Sparkles", "PostEffect" }
+local WEAK_KEYS = { __mode = "k" }
+
+local CFG = {
+	SafeMode = false,              -- Safe Mode: tránh đụng gameplay
+	BudgetMs = 1.5,               -- ngân sách xử lý tối đa mỗi frame (ms)
+	MaxQueue = 60000,             -- giới hạn hàng đợi sự kiện
+	TickInterval = 1,             -- chu kỳ của vòng lặp duy nhất (giây)
+	MemorySampleSec = 5,          -- chu kỳ đo Lua memory
+	MemoryHistory = 120,          -- số mẫu giữ lại (~10 phút nếu 5s/mẫu)
+	MemoryMinSamples = 12,        -- tối thiểu để phân tích
+	EffectSampleSec = 10,         -- chu kỳ phân tích tăng trưởng hiệu ứng
+	EffectHistory = 60,
+	EffectGrowthWarnPerMin = 120, -- ngưỡng cảnh báo (hiệu ứng/phút)
+	LingerMinAge = 90,            -- tuổi tối thiểu (giây) để coi là "tồn đọng"
+	RescanSec = 120,              -- kiểm tra đối chiếu tần suất thấp
+}
+
+--==============================================================
+-- 2. KHAI BÁO TRƯỚC CÁC MODULE
+--==============================================================
+local Core = { alive = true, autoStart = true }
+local Worker = { conn = nil }
+local Queue = { items = {}, head = 1, tail = 0, dropped = 0 }
+local Scan = { active = false, lists = {}, li = 1, i = 1, total = 0, done = 0, again = false }
+local Watch = { users = {}, n = 0 }
+local Restore = { store = setmetatable({}, WEAK_KEYS), applied = setmetatable({}, WEAK_KEYS), counts = {}, jobs = {} }
+local Gr = { enabled = false }
+local Fx = { enabled = false, reduce = true, live = {} }
+local Mem = { enabled = false, kb = {}, t = {}, state = "Off", detail = "", slope = 0, troughs = 0,
+	engineMB = nil, engineOk = true, gcResult = "-" }
+local Perf = { enabled = false, frames = 0, events = 0, selfTime = 0, fps = 0, selfMsPerSec = 0,
+	eventsPerSec = 0, lastT = os.clock(), lastSelf = 0, lastEvents = 0, lastFrames = 0, conn = nil }
+local UI = { pages = {}, tabButtons = {}, current = "Dashboard", minimized = false }
+local GUI, Main, Body
+
+--==============================================================
+-- 3. CONNECTION REGISTRY (quản lý & đếm connection do script tạo)
+--==============================================================
+local Conn = { list = {}, n = 0 }
+
+function Conn.add(tag, connection)
+	local bucket = Conn.list[tag]
+	if not bucket then
+		bucket = {}
+		Conn.list[tag] = bucket
+	end
+	bucket[connection] = true
+	Conn.n += 1
+	return connection
+end
+
+function Conn.remove(tag, connection)
+	local bucket = Conn.list[tag]
+	if bucket and bucket[connection] then
+		bucket[connection] = nil
+		Conn.n -= 1
+		pcall(function() connection:Disconnect() end)
+	end
+end
+
+function Conn.clear(tag)
+	local bucket = Conn.list[tag]
+	if not bucket then return end
+	for connection in pairs(bucket) do
+		pcall(function() connection:Disconnect() end)
+		Conn.n -= 1
+	end
+	Conn.list[tag] = nil
+end
+
+function Conn.clearAll()
+	local tags = {}
+	for tag in pairs(Conn.list) do tags[#tags + 1] = tag end
+	for _, tag in ipairs(tags) do Conn.clear(tag) end
+	Conn.n = 0
+end
+
+--==============================================================
+-- 4. TASK REGISTRY (phát hiện tác vụ không được giải phóng)
+--==============================================================
+local Tasks = { alive = 0, names = {} }
+
+function Tasks.spawn(name, fn)
+	Tasks.alive += 1
+	Tasks.names[name] = (Tasks.names[name] or 0) + 1
+	return task.spawn(function()
+		local ok, err = pcall(fn)
+		Tasks.alive -= 1
+		local left = (Tasks.names[name] or 1) - 1
+		Tasks.names[name] = left > 0 and left or nil
+		if not ok then warn("[SuperOptimizer V3.0] Task '" .. name .. "' lỗi: " .. tostring(err)) end
+	end)
+end
+
+--==============================================================
+-- 5. RESTORE MANAGER
+-- Lưu thuộc tính gốc trước khi sửa. Chỉ khôi phục nếu giá trị hiện tại
+-- vẫn bằng giá trị mà optimizer đã đặt (không ghi đè thay đổi mới của game).
+-- store[obj] = { __owner = "Graphics"|"Effects", [prop] = giá trị gốc }
+--==============================================================
+local function getProp(obj, prop) return obj[prop] end
+local function setProp(obj, prop, value) obj[prop] = value end
+
+local function entryIsEmpty(entry)
+	for key in pairs(entry) do
+		if key ~= "__owner" then return false end
+	end
+	return true
+end
+
+-- Trả về true nếu đây là lần đầu đối tượng/thuộc tính bị thay đổi.
+function Restore.set(owner, obj, prop, value)
+	local okRead, current = pcall(getProp, obj, prop)
+	if not okRead then return false end
+
+	local entry = Restore.store[obj]
+	local had = entry ~= nil and entry[prop] ~= nil
+
+	if had then
+		-- Game đã tự đổi giá trị sau khi ta áp dụng -> coi giá trị mới là "gốc".
+		local appliedForObject = Restore.applied[obj]
+		if not appliedForObject or current ~= appliedForObject[prop] then entry[prop] = current end
+	else
+		if current == value then return false end -- không cần thay đổi
+		if not entry then
+			entry = { __owner = owner }
+			Restore.store[obj] = entry
+			Restore.counts[owner] = (Restore.counts[owner] or 0) + 1
+		end
+		entry[prop] = current
+	end
+
+	if current ~= value then
+		local okWrite = pcall(setProp, obj, prop, value)
+		if not okWrite then
+			if not had then
+				entry[prop] = nil
+				if entryIsEmpty(entry) then
+					Restore.store[obj] = nil
+					Restore.counts[owner] = math.max(0, (Restore.counts[owner] or 1) - 1)
+				end
+			end
+			return false
+		end
+	end
+
+	local appliedForObject = Restore.applied[obj]
+	if not appliedForObject then
+		appliedForObject = {}
+		Restore.applied[obj] = appliedForObject
+	end
+	appliedForObject[prop] = value
+	return not had
+end
+
+function Restore.restoreObject(owner, obj)
+	local entry = Restore.store[obj]
+	if not entry or entry.__owner ~= owner then return end
+	for prop, original in pairs(entry) do
+		if prop ~= "__owner" then
+			local ok, current = pcall(getProp, obj, prop)
+			local appliedForObject = Restore.applied[obj]
+			if ok and appliedForObject and current == appliedForObject[prop] then
+				pcall(setProp, obj, prop, original)
+			end
+		end
+	end
+	Restore.store[obj] = nil
+	Restore.applied[obj] = nil
+	Restore.counts[owner] = math.max(0, (Restore.counts[owner] or 1) - 1)
+end
+
+-- Tạo job khôi phục theo lát (chunked). force=true: bỏ qua kiểm tra module đang bật.
+function Restore.begin(owner, force, onDone)
+	local list, n = {}, 0
+	for obj, entry in pairs(Restore.store) do
+		if entry.__owner == owner then
+			n += 1
+			list[n] = obj
+		end
+	end
+	local job = { owner = owner, list = list, n = n, i = 1, force = force, onDone = onDone, done = false }
+	if n == 0 then
+		job.done = true
+		if onDone then pcall(onDone) end
+		return job
+	end
+	Restore.jobs[#Restore.jobs + 1] = job
+	Worker.kick()
+	return job
+end
+
+function Restore.runJob(job, deadline)
+	if job.done then return true end
+	-- Module được bật lại trong lúc khôi phục: bỏ job, giữ nguyên entry.
+	if not job.force and Core.applying[job.owner]() then
+		job.done = true
+		job.list = {}
+		return true
+	end
+	local list, count = job.list, 0
+	while job.i <= job.n do
+		local obj = list[job.i]
+		list[job.i] = nil
+		job.i += 1
+		if obj then Restore.restoreObject(job.owner, obj) end
+		count += 1
+		if deadline and count % 32 == 0 and os.clock() > deadline and job.i <= job.n then
+			return false
+		end
+	end
+	job.done = true
+	if job.onDone then pcall(job.onDone) end
+	return true
+end
+
+function Restore.step(deadline)
+	local jobs = Restore.jobs
+	while jobs[1] do
+		if Restore.runJob(jobs[1], deadline) then
+			table.remove(jobs, 1)
+		else
+			return false
+		end
+	end
+	return true
+end
+
+-- Khôi phục đồng bộ toàn bộ (chỉ dùng nội bộ khi Unload).
+function Restore.flush(owner)
+	for _, job in ipairs(Restore.jobs) do
+		if job.owner == owner then
+			job.force = true
+			Restore.runJob(job, nil)
+		end
+	end
+	local job = Restore.begin(owner, true)
+	if not job.done then Restore.runJob(job, nil) end
+	local kept = {}
+	for _, j in ipairs(Restore.jobs) do
+		if not j.done then kept[#kept + 1] = j end
+	end
+	Restore.jobs = kept
+end
+
+function Restore.pending()
+	local total = 0
+	for _, job in ipairs(Restore.jobs) do
+		if not job.done then total += job.n - job.i + 1 end
+	end
+	return total
+end
+
+--==============================================================
+-- 6. QUEUE (debounce: sự kiện chỉ đẩy vào hàng đợi, xử lý theo lát mỗi frame)
+--==============================================================
+function Queue.push(obj)
+	if Queue.tail - Queue.head >= CFG.MaxQueue then
+		Queue.dropped += 1
+		return
+	end
+	Queue.tail += 1
+	Queue.items[Queue.tail] = obj
+end
+
+function Queue.pop()
+	if Queue.head > Queue.tail then return nil end
+	local obj = Queue.items[Queue.head]
+	Queue.items[Queue.head] = nil
+	Queue.head += 1
+	if Queue.head > Queue.tail then
+		Queue.head, Queue.tail = 1, 0
+	end
+	return obj
+end
+
+function Queue.size()
+	return Queue.tail - Queue.head + 1
+end
+
+function Queue.clear()
+	Queue.items = {}
+	Queue.head, Queue.tail = 1, 0
+end
+
+--==============================================================
+-- 7. PHÂN LOẠI ĐỐI TƯỢNG (cache theo ClassName để tránh IsA lặp lại)
+--==============================================================
+local classCache = {}
+
+local function infoOf(obj)
+	local className = obj.ClassName
+	local info = classCache[className]
+	if info == nil then
+		info = { cat = false, part = false }
+		for _, base in ipairs(EFFECT_BASES) do
+			if obj:IsA(base) then
+				info.cat = base
+				break
+			end
+		end
+		if not info.cat and obj:IsA("BasePart") and not obj:IsA("Terrain") then
+			info.part = true
+		end
+		classCache[className] = info
+	end
+	return info
+end
+
+-- Safe Mode: hiệu ứng nằm trong model có Humanoid (nhân vật/NPC) được bảo vệ.
+local function inCharacter(obj)
+	local model = obj:FindFirstAncestorOfClass("Model")
+	local guard = 0
+	while model and guard < 6 do
+		if model:FindFirstChildOfClass("Humanoid") then return true end
+		local parent = model.Parent
+		model = parent and parent:FindFirstAncestorOfClass("Model") or nil
+		guard += 1
+	end
+	return false
+end
+
+--==============================================================
+-- 8. GRAPHICS OPTIMIZER
+-- Safe: tắt đổ bóng toàn cục, CastShadow, PostEffect, trang trí terrain, sóng nước.
+-- Aggressive (Safe Mode OFF): thêm Material=SmoothPlastic, Reflectance=0,
+--   giảm ánh sáng môi trường, hạ QualityLevel (nếu client cho phép).
+-- Không Destroy, không đụng Transparency/CanCollide/Anchored.
+--==============================================================
+local function applyGlobalGraphics()
+	Restore.set("Graphics", Lighting, "GlobalShadows", false)
+
+	local terrain = Workspace:FindFirstChildOfClass("Terrain")
+	if terrain then
+		Restore.set("Graphics", terrain, "Decoration", false)
+		Restore.set("Graphics", terrain, "WaterWaveSize", 0)
+		Restore.set("Graphics", terrain, "WaterWaveSpeed", 0)
+	end
+
+	if not CFG.SafeMode then
+		Restore.set("Graphics", Lighting, "EnvironmentDiffuseScale", 0)
+		Restore.set("Graphics", Lighting, "EnvironmentSpecularScale", 0)
+		local okR, rendering = pcall(function() return settings().Rendering end)
+		if okR and rendering then
+			Restore.set("Graphics", rendering, "QualityLevel", Enum.QualityLevel.Level01)
+		end
+	end
+end
+
+local function applyGraphicsToPart(part)
+	Restore.set("Graphics", part, "CastShadow", false)
+	if not CFG.SafeMode then
+		Restore.set("Graphics", part, "Material", Enum.Material.SmoothPlastic)
+		Restore.set("Graphics", part, "Reflectance", 0)
+	end
+end
+
+function Gr.set(enabled)
+	enabled = enabled and true or false
+	-- Module luôn ON khi optimizer đang chạy; chỉ UNLOAD mới được phép tắt.
+	if Core.alive and not enabled then return end
+	if not Core.alive and enabled then return end
+	if enabled == Gr.enabled then return end
+	Gr.enabled = enabled
+	if enabled then
+		applyGlobalGraphics()
+		Watch.acquire("Graphics")
+		Scan.request()
+	else
+		Watch.release("Graphics")
+		Restore.begin("Graphics", false)
+	end
+end
+
+--==============================================================
+-- 9. ADVANCED EFFECT MANAGER
+-- Theo dõi: số hiện tại, tạo mới, bị xóa, tốc độ tăng, đối tượng tồn đọng.
+-- Nguồn dữ liệu: DescendantAdded/Removing + 1 lần quét đầu + đối chiếu tần suất thấp.
+-- PostEffect được đếm ở đây nhưng chỉ bị tắt bởi module Graphics.
+--==============================================================
+function Fx.resetTracking()
+	Fx.cat = setmetatable({}, WEAK_KEYS)
+	Fx.born = setmetatable({}, WEAK_KEYS)
+	for _, c in ipairs(EFFECT_BASES) do Fx.live[c] = 0 end
+	Fx.liveTotal = 0
+	Fx.created, Fx.removed, Fx.discovered, Fx.reconciled, Fx.processed = 0, 0, 0, 0, 0
+	Fx.baseline, Fx.baselineTime = nil, nil
+	Fx.history = {}
+	Fx.lifeEMA, Fx.removedSamples = nil, 0
+	Fx.rate, Fx.streak, Fx.warn = 0, 0, nil
+	Fx.lingering, Fx.lingerState = nil, "no data"
+end
+Fx.resetTracking()
+
+function Fx.track(obj, cat, fromEvent)
+	if Fx.cat[obj] then return false end
+	Fx.cat[obj] = cat
+	Fx.born[obj] = os.clock()
+	Fx.live[cat] += 1
+	Fx.liveTotal += 1
+	if fromEvent and Fx.baseline then
+		Fx.created += 1
+	elseif Fx.baseline then
+		Fx.reconciled += 1 -- tìm thấy qua đối chiếu (sự kiện bị lỡ hoặc đang chờ)
+	else
+		Fx.discovered += 1
+	end
+	return true
+end
+
+function Fx.untrack(obj)
+	local cat = Fx.cat[obj]
+	if not cat then return end
+	local born = Fx.born[obj]
+	Fx.cat[obj] = nil
+	Fx.born[obj] = nil
+	Fx.live[cat] -= 1
+	Fx.liveTotal -= 1
+	Fx.removed += 1
+	if born then
+		local life = os.clock() - born
+		Fx.lifeEMA = Fx.lifeEMA and (Fx.lifeEMA * 0.9 + life * 0.1) or life
+		Fx.removedSamples += 1
+	end
+end
+
+-- Loại các mục không còn nằm trong game (sự kiện Removing có thể bị lỡ).
+function Fx.prune()
+	for obj in pairs(Fx.cat) do
+		local ok, inGame = pcall(obj.IsDescendantOf, obj, game)
+		if not ok or not inGame then Fx.untrack(obj) end
+	end
+end
+
+function Fx.onScanDone()
+	if not Fx.enabled then return end
+	Fx.prune()
+	if not Fx.baseline then
+		Fx.baseline = Fx.liveTotal
+		Fx.baselineTime = os.clock()
+		Fx.history = { { t = Fx.baselineTime, n = Fx.liveTotal } }
+	end
+end
+
+-- Phân tích tăng trưởng (gọi theo chu kỳ thấp từ ticker).
+function Fx.analyze()
+	if not Fx.baseline then return end
+	local now = os.clock()
+	local h = Fx.history
+	h[#h + 1] = { t = now, n = Fx.liveTotal }
+	if #h > CFG.EffectHistory then table.remove(h, 1) end
+
+	local count = #h
+	if count >= 2 then
+		if h[count].n > h[count - 1].n then Fx.streak += 1 else Fx.streak = 0 end
+	end
+
+	local back = math.max(1, count - 6)
+	local dt = h[count].t - h[back].t
+	if count >= 2 and dt > 0 then
+		Fx.rate = (h[count].n - h[back].n) / dt * 60
+	else
+		Fx.rate = 0
+	end
+
+	-- Đối tượng tồn đọng: sinh ra SAU baseline và sống lâu hơn nhiều so với tuổi thọ
+	-- trung bình của hiệu ứng đã bị xóa. Chỉ là dấu hiệu, KHÔNG phải kết luận leak.
+	if Fx.removedSamples >= 20 and Fx.lifeEMA then
+		local threshold = math.max(CFG.LingerMinAge, Fx.lifeEMA * 3)
+		local c = 0
+		for _, born in pairs(Fx.born) do
+			if born >= Fx.baselineTime and now - born > threshold then c += 1 end
+		end
+		Fx.lingering, Fx.lingerState = c, "ok"
+	else
+		Fx.lingering = nil
+		Fx.lingerState = string.format("need data (%d/20 removals)", Fx.removedSamples)
+	end
+
+	if Fx.rate > CFG.EffectGrowthWarnPerMin and Fx.streak >= 3 then
+		Fx.warn = string.format("Effects +%.0f/min", Fx.rate)
+	elseif Fx.lingering and Fx.lingering >= 50 and Fx.streak >= 3 then
+		Fx.warn = string.format("Effects lingering: %d", Fx.lingering)
+	else
+		Fx.warn = nil
+	end
+end
+
+local function reduceEffect(obj, cat)
+	if CFG.SafeMode then
+		if cat == "Beam" or cat == "Trail" then return end -- thường là thành phần gameplay
+		if inCharacter(obj) then return end
+	end
+	if Restore.set("Effects", obj, "Enabled", false) then
+		Fx.processed += 1
+	end
+end
+
+function Fx.set(enabled)
+	enabled = enabled and true or false
+	-- Module luôn ON khi optimizer đang chạy; chỉ UNLOAD mới được phép tắt.
+	if Core.alive and not enabled then return end
+	if not Core.alive and enabled then return end
+	if enabled == Fx.enabled then return end
+	Fx.enabled = enabled
+	if enabled then
+		Fx.resetTracking()
+		Watch.acquire("Effects")
+		Scan.request()
+	else
+		Watch.release("Effects")
+		Fx.resetTracking()
+		Restore.begin("Effects", false)
+	end
+end
+
+function Fx.setReduce(value)
+	value = value and true or false
+	-- Chế độ giảm hiệu ứng luôn được giữ ON khi optimizer hoạt động.
+	if Core.alive and not value then return end
+	if not Core.alive and value then return end
+	if value == Fx.reduce then return end
+	Fx.reduce = value
+	if Fx.enabled then
+		if value then
+			Scan.request()
+		else
+			Restore.begin("Effects", false)
+		end
+	end
+end
+
+--==============================================================
+-- 10. XỬ LÝ ĐỐI TƯỢNG (dùng chung cho sự kiện và quét)
+--==============================================================
+local function processObject(obj, fromEvent)
+	local fxOn, grOn = Fx.enabled, Gr.enabled
+	if not (fxOn or grOn) then return end
+
+	local info = infoOf(obj)
+	local cat = info.cat
+	if cat then
+		if fxOn then
+			local okIn, inGame = pcall(obj.IsDescendantOf, obj, game)
+			if okIn and inGame then
+				Fx.track(obj, cat, fromEvent)
+				if Fx.reduce and cat ~= "PostEffect" then reduceEffect(obj, cat) end
+			end
+		end
+		if grOn and cat == "PostEffect" then
+			Restore.set("Graphics", obj, "Enabled", false)
+		end
+	elseif info.part and grOn then
+		applyGraphicsToPart(obj)
+	end
+end
+
+--==============================================================
+-- 11. WATCH (DescendantAdded / DescendantRemoving, dùng chung, đếm tham chiếu)
+--==============================================================
+local function onAdded(obj)
+	Perf.events += 1
+	local info = infoOf(obj)
+	local wanted = false
+	if info.cat then
+		wanted = Fx.enabled or (info.cat == "PostEffect" and Gr.enabled)
+	elseif info.part then
+		wanted = Gr.enabled
+	end
+	if wanted then
+		Queue.push(obj)
+		Worker.kick()
+	end
+end
+
+local function onRemoving(obj)
+	if Fx.enabled and Fx.cat[obj] then Fx.untrack(obj) end
+end
+
+function Watch.acquire(owner)
+	if Watch.users[owner] then return end
+	Watch.users[owner] = true
+	Watch.n += 1
+	if Watch.n == 1 then
+		Conn.add("Watch", Workspace.DescendantAdded:Connect(onAdded))
+		Conn.add("Watch", Workspace.DescendantRemoving:Connect(onRemoving))
+		Conn.add("Watch", Lighting.DescendantAdded:Connect(onAdded))
+		Conn.add("Watch", Lighting.DescendantRemoving:Connect(onRemoving))
+	end
+end
+
+function Watch.release(owner)
+	if not Watch.users[owner] then return end
+	Watch.users[owner] = nil
+	Watch.n -= 1
+	if Watch.n <= 0 then
+		Watch.n = 0
+		Conn.clear("Watch")
+		Queue.clear()
+	end
+end
+
+--==============================================================
+-- 12. SCAN (quét theo lát, chỉ khi bật module / đối chiếu định kỳ)
+--==============================================================
+function Scan.begin()
+	Scan.active = true
+	Scan.again = false
+	local okW, wsList = pcall(function() return Workspace:GetDescendants() end)
+	local okL, ltList = pcall(function() return Lighting:GetDescendants() end)
+	Scan.lists = { okW and wsList or {}, okL and ltList or {} }
+	Scan.li, Scan.i, Scan.done = 1, 1, 0
+	Scan.total = #Scan.lists[1] + #Scan.lists[2]
+end
+
+function Scan.request()
+	if not Core.alive then return end
+	if Scan.active then
+		Scan.again = true
+	else
+		Scan.begin()
+	end
+	Worker.kick()
+end
+
+function Scan.finish()
+	Scan.active = false
+	Scan.lists = {}
+	pcall(Fx.onScanDone)
+	if Scan.again and Core.alive then Scan.begin() end
+end
+
+function Scan.step(deadline)
+	local count = 0
+	while Scan.active do
+		local list = Scan.lists[Scan.li]
+		if not list then
+			Scan.finish()
+			return
+		end
+		local obj = list[Scan.i]
+		if obj == nil then
+			Scan.lists[Scan.li] = false
+			Scan.li += 1
+			Scan.i = 1
+		else
+			list[Scan.i] = nil
+			Scan.i += 1
+			Scan.done += 1
+			pcall(processObject, obj, false)
+			count += 1
+			if count % 32 == 0 and os.clock() > deadline then return end
+		end
+	end
+end
+
+function Scan.reset()
+	Scan.active = false
+	Scan.again = false
+	Scan.lists = {}
+	Scan.done, Scan.total = 0, 0
+end
+
+--==============================================================
+-- 13. WORKER (Heartbeat chỉ tồn tại khi còn việc; tự ngắt khi rảnh)
+-- Ngân sách mỗi frame giảm 60% nếu frame đang chậm (dt > 50ms).
+--==============================================================
+function Worker.hasWork()
+	return Queue.size() > 0 or Scan.active or #Restore.jobs > 0
+end
+
+function Worker.kick()
+	if Worker.conn or not Core.alive then return end
+	Worker.conn = Conn.add("Worker", RunService.Heartbeat:Connect(Worker.step))
+end
+
+function Worker.stop()
+	if Worker.conn then
+		Conn.remove("Worker", Worker.conn)
+		Worker.conn = nil
+	end
+end
+
+function Worker.step(dt)
+	if not Core.alive then
+		Worker.stop()
+		return
+	end
+	local t0 = os.clock()
+	local budget = CFG.BudgetMs / 1000
+	if dt > 0.05 then budget = budget * 0.4 end
+	local deadline = t0 + budget
+
+	pcall(Restore.step, deadline)
+
+	if os.clock() < deadline then
+		local n = 0
+		while true do
+			local obj = Queue.pop()
+			if obj == nil then break end
+			pcall(processObject, obj, true)
+			n += 1
+			if n % 16 == 0 and os.clock() > deadline then break end
+		end
+	end
+
+	if Scan.active and os.clock() < deadline then
+		pcall(Scan.step, deadline)
+	end
+
+	Perf.selfTime += os.clock() - t0
+	if not Worker.hasWork() then Worker.stop() end
+end
+
+--==============================================================
+-- 14. MEMORY LEAK DETECTOR
+-- Chỉ đo Lua heap nếu môi trường hỗ trợ collectgarbage("count").
+-- KHÔNG gồm texture/mesh/âm thanh/bộ nhớ engine. Không tự gọi GC.
+-- Phân biệt: tăng tạm thời (spike) vs tăng liên tục (đáy sau GC tăng dần).
+--==============================================================
+-- Delta/Roblox client không phải lúc nào cũng cung cấp collectgarbage.
+-- Kiểm tra tồn tại trước khi gọi để tránh pcall(nil, ...).
+local function readLuaKB()
+	if type(collectgarbage) ~= "function" then return nil end
+	local ok, v = pcall(collectgarbage, "count")
+	if ok and type(v) == "number" then return v end
+	return nil
+end
+
+function Mem.reset()
+	Mem.kb, Mem.t = {}, {}
+	Mem.state, Mem.detail, Mem.slope, Mem.troughs = "Collecting", "", 0, 0
+end
+Mem.reset()
+
+function Mem.analyze()
+	local kb, t = Mem.kb, Mem.t
+	local n = #kb
+	if n < CFG.MemoryMinSamples then
+		Mem.state = "Collecting"
+		Mem.detail = string.format("%d/%d samples", n, CFG.MemoryMinSamples)
+		return
+	end
+
+	-- Hồi quy tuyến tính: độ dốc MB/phút
+	local sx, sy, sxx, sxy = 0, 0, 0, 0
+	local t0 = t[1]
+	for i = 1, n do
+		local x = (t[i] - t0) / 60
+		local y = kb[i] / 1024
+		sx += x; sy += y; sxx += x * x; sxy += x * y
+	end
+	local denom = n * sxx - sx * sx
+	Mem.slope = denom ~= 0 and (n * sxy - sx * sy) / denom or 0
+
+	-- Các "đáy" (sau khi GC thu hồi)
+	local troughs = {}
+	for i = 2, n - 1 do
+		if kb[i] < kb[i - 1] and kb[i] <= kb[i + 1] then troughs[#troughs + 1] = kb[i] end
+	end
+	Mem.troughs = #troughs
+	local spanMin = (t[n] - t[1]) / 60
+
+	local rising = false
+	if #troughs >= 3 then
+		local half = math.floor(#troughs / 2)
+		local s1, s2 = 0, 0
+		for i = 1, half do s1 += troughs[i] end
+		for i = #troughs - half + 1, #troughs do s2 += troughs[i] end
+		local m1, m2 = s1 / half, s2 / half
+		local up = 0
+		for i = 1, #troughs - 1 do
+			if troughs[i + 1] >= troughs[i] * 0.995 then up += 1 end
+		end
+		local frac = up / (#troughs - 1)
+		rising = (m2 - m1) >= math.max(3072, m1 * 0.05) and frac >= 0.6 and Mem.slope > 0
+	else
+		-- Chưa thấy GC thu hồi: xét tăng đơn điệu kéo dài
+		local nonDec = 0
+		for i = 2, n do
+			if kb[i] >= kb[i - 1] then nonDec += 1 end
+		end
+		rising = (kb[n] - kb[1]) >= 5120 and nonDec / (n - 1) >= 0.85 and Mem.slope > 0
+	end
+
+	if rising then
+		Mem.state = spanMin >= 3 and "Rising (sustained)" or "Possible rise"
+	else
+		local sorted = table.clone(kb)
+		table.sort(sorted)
+		local median = sorted[math.ceil(n / 2)]
+		if kb[n] > median * 1.2 then
+			Mem.state = "Temporary spike"
+		else
+			Mem.state = "Stable"
+		end
+	end
+	Mem.detail = string.format("%+.2f MB/min, troughs %d, %.1f min", Mem.slope, Mem.troughs, spanMin)
+end
+
+function Mem.sample()
+	-- Đo bộ nhớ tổng của client độc lập với Lua heap.
+	if Mem.engineOk then
+		local ok, v = pcall(function() return Stats:GetTotalMemoryUsageMb() end)
+		if ok and type(v) == "number" then
+			Mem.engineMB = v
+		else
+			Mem.engineOk, Mem.engineMB = false, nil
+		end
+	end
+
+	-- Lua heap chỉ có thể đo nếu môi trường thực sự cung cấp collectgarbage.
+	local kb = readLuaKB()
+	if not kb then
+		if #Mem.kb == 0 then
+			Mem.state = "Unavailable"
+			Mem.detail = "Lua heap API không được hỗ trợ; Client total vẫn được đo nếu Stats cho phép."
+		end
+		return
+	end
+
+	Mem.kb[#Mem.kb + 1] = kb
+	Mem.t[#Mem.t + 1] = os.clock()
+	if #Mem.kb > CFG.MemoryHistory then
+		table.remove(Mem.kb, 1)
+		table.remove(Mem.t, 1)
+	end
+	Mem.analyze()
+end
+
+function Mem.set(enabled)
+	enabled = enabled and true or false
+	if Core.alive and not enabled then return end
+	if not Core.alive and enabled then return end
+	if enabled == Mem.enabled then return end
+	Mem.enabled = enabled
+	Mem.reset()
+	if enabled then pcall(Mem.sample) else Mem.state = "Off" end
+end
+
+-- Chỉ chạy khi người dùng bấm. Dùng để so sánh trước/sau: nếu giảm mạnh -> đó là rác
+-- chưa được thu hồi, không phải leak. Có thể không được hỗ trợ trong môi trường.
+function Mem.manualGC()
+	if type(collectgarbage) ~= "function" then
+		Mem.gcResult = "Delta không cung cấp collectgarbage"
+		return
+	end
+	local before = readLuaKB()
+	local ok = pcall(collectgarbage, "collect")
+	local after = readLuaKB()
+	if ok and before and after then
+		Mem.gcResult = string.format("%.1f -> %.1f MB (%+.1f)", before / 1024, after / 1024, (after - before) / 1024)
+	else
+		Mem.gcResult = "collect không được hỗ trợ"
+	end
+end
+
+--==============================================================
+-- 15. PERFORMANCE MONITOR (tự đo overhead của chính script)
+--==============================================================
+function Perf.reset()
+	Perf.frames, Perf.events, Perf.selfTime = 0, 0, 0
+	Perf.fps, Perf.selfMsPerSec, Perf.eventsPerSec = 0, 0, 0
+	Perf.lastT = os.clock()
+	Perf.lastSelf, Perf.lastEvents, Perf.lastFrames = 0, 0, 0
+end
+
+function Perf.set(enabled)
+	enabled = enabled and true or false
+	if Core.alive and not enabled then return end
+	if not Core.alive and enabled then return end
+	if enabled == Perf.enabled then return end
+	Perf.enabled = enabled
+	if enabled then
+		Perf.reset()
+		Perf.conn = Conn.add("Perf", RunService.Heartbeat:Connect(function()
+			Perf.frames += 1
+		end))
+	else
+		Conn.clear("Perf")
+		Perf.conn = nil
+	end
+end
+
+function Perf.sample(now)
+	local dt = now - Perf.lastT
+	if dt < 0.5 then return end
+	Perf.fps = (Perf.frames - Perf.lastFrames) / dt
+	Perf.selfMsPerSec = (Perf.selfTime - Perf.lastSelf) / dt * 1000
+	Perf.eventsPerSec = (Perf.events - Perf.lastEvents) / dt
+	Perf.lastT = now
+	Perf.lastFrames, Perf.lastSelf, Perf.lastEvents = Perf.frames, Perf.selfTime, Perf.events
+end
+
+--==============================================================
+-- 16. CORE (điều khiển tổng)
+--==============================================================
+Core.applying = {
+	Graphics = function() return Gr.enabled end,
+	Effects = function() return Fx.enabled and Fx.reduce end,
+}
+
+function Core.enableAll()
+	Gr.set(true)
+	Fx.set(true)
+	Mem.set(true)
+	Perf.set(true)
+end
+
+-- Không có API tắt module riêng lẻ. Việc dừng chỉ thực hiện qua UNLOAD.
+
+-- Chỉ gọi khi UNLOAD: khôi phục đồng bộ + dọn dữ liệu + ngắt connection.
+function Core.restoreAll()
+	-- Chỉ UNLOAD (Core.alive = false) mới được phép khôi phục/tắt module.
+	if Core.alive then return false end
+	Gr.set(false)
+	Fx.set(false)
+	Mem.set(false)
+	Perf.set(false)
+	Restore.flush("Graphics")
+	Restore.flush("Effects")
+	Restore.store = setmetatable({}, WEAK_KEYS)
+	Restore.applied, Restore.counts, Restore.jobs = setmetatable({}, WEAK_KEYS), {}, {}
+	Queue.clear()
+	Queue.dropped = 0
+	Scan.reset()
+	Fx.resetTracking()
+	Mem.reset()
+	Mem.state = "Off"
+	Mem.gcResult = "-"
+	Perf.reset()
+	Watch.users, Watch.n = {}, 0
+	Conn.clear("Watch")
+	Worker.stop()
+end
+
+function Core.setSafe(value)
+	value = value and true or false
+	if CFG.SafeMode == value then return end
+	CFG.SafeMode = value
+	-- Khôi phục rồi áp dụng lại theo chế độ mới.
+	if Gr.enabled then
+		Restore.begin("Graphics", true, function()
+			if Core.alive and Gr.enabled then
+				applyGlobalGraphics()
+				Scan.request()
+			end
+		end)
+	end
+	if Fx.enabled and Fx.reduce then
+		Restore.begin("Effects", true, function()
+			if Core.alive and Fx.enabled and Fx.reduce then Scan.request() end
+		end)
+	end
+end
+
+function Core.unload()
+	if not Core.alive then return end
+	Core.alive = false
+	pcall(Core.restoreAll)
+	Conn.clearAll()
+	if GUI then pcall(function() GUI:Destroy() end) end
+	pcall(function()
+		local registry = shared
+		if registry and registry.RobloxSuperOptimizer
+			and registry.RobloxSuperOptimizer.Version == "3.0" then
+			registry.RobloxSuperOptimizer = nil
+		end
+	end)
+end
+
+local function collectWarnings()
+	local w = {}
+	if Mem.enabled and Mem.state == "Rising (sustained)" then w[#w + 1] = "Lua memory rising" end
+	if Fx.enabled and Fx.warn then w[#w + 1] = Fx.warn end
+	if Perf.enabled and Perf.fps > 0 and Perf.fps < 15 then w[#w + 1] = "Low FPS" end
+	if Queue.dropped > 0 then w[#w + 1] = "Queue overflow" end
+	if Tasks.alive > 1 then w[#w + 1] = "Extra tasks: " .. Tasks.alive end
+	return w
+end
+
+--==============================================================
+-- 17. GUI
+--==============================================================
+local C = {
+	bg = Color3.fromRGB(13, 18, 30),
+	panel = Color3.fromRGB(23, 32, 50),
+	accent = Color3.fromRGB(91, 166, 255),
+	on = Color3.fromRGB(46, 160, 90),
+	off = Color3.fromRGB(72, 78, 98),
+	warn = Color3.fromRGB(235, 100, 90),
+	text = Color3.fromRGB(232, 236, 250),
+	sub = Color3.fromRGB(150, 158, 182),
+	btn = Color3.fromRGB(34, 48, 72),
+}
+
+local function make(className, props, parent)
+	local inst = Instance.new(className)
+	for k, v in pairs(props) do inst[k] = v end
+	if parent then inst.Parent = parent end
+	return inst
+end
+
+local function corner(inst, radius)
+	make("UICorner", { CornerRadius = UDim.new(0, radius) }, inst)
+end
+
+local function nextOrder(page)
+	page.order += 1
+	return page.order
+end
+
+local function newPage(name, holder)
+	local sf = make("ScrollingFrame", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 3,
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		CanvasSize = UDim2.new(),
+		Visible = false,
+	}, holder)
+	make("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, sf)
+	local page = { name = name, frame = sf, refreshers = {}, order = 0 }
+	UI.pages[name] = page
+	return page
+end
+
+local function addHeader(page, text)
+	make("TextLabel", {
+		Size = UDim2.new(1, -6, 0, 18), BackgroundTransparency = 1, Text = text,
+		TextColor3 = C.accent, Font = Enum.Font.GothamBold, TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = nextOrder(page),
+	}, page.frame)
+end
+
+local function addNote(page, text)
+	make("TextLabel", {
+		Size = UDim2.new(1, -6, 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1, Text = text, TextColor3 = C.sub, Font = Enum.Font.Gotham,
+		TextSize = 11, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top, LayoutOrder = nextOrder(page),
+	}, page.frame)
+end
+
+local function addRow(page, label, getter, colorGetter)
+	local row = make("Frame", {
+		Size = UDim2.new(1, -6, 0, 20), BackgroundTransparency = 1, LayoutOrder = nextOrder(page),
+	}, page.frame)
+	make("TextLabel", {
+		Size = UDim2.new(0.46, 0, 1, 0), BackgroundTransparency = 1, Text = label,
+		TextColor3 = C.sub, Font = Enum.Font.Gotham, TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+	}, row)
+	local value = make("TextLabel", {
+		Position = UDim2.fromScale(0.46, 0), Size = UDim2.new(0.54, 0, 1, 0),
+		BackgroundTransparency = 1, Text = "-", TextColor3 = C.text, Font = Enum.Font.GothamBold,
+		TextSize = 12, TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd,
+	}, row)
+	table.insert(page.refreshers, function()
+		local text = tostring(getter())
+		if value.Text ~= text then value.Text = text end
+		local color = colorGetter and colorGetter() or C.text
+		if value.TextColor3 ~= color then value.TextColor3 = color end
+	end)
+end
+
+-- Không tạo nút Toggle: các module tự khởi chạy và luôn ON.
+
+-- defs = { {text = string|function, cb = function, color = Color3?}, ... }
+local function addButtons(page, defs)
+	local row = make("Frame", {
+		Size = UDim2.new(1, -6, 0, 28), BackgroundTransparency = 1, LayoutOrder = nextOrder(page),
+	}, page.frame)
+	local n = #defs
+	for i, def in ipairs(defs) do
+		local isFn = type(def.text) == "function"
+		local btn = make("TextButton", {
+			Size = UDim2.new(1 / n, -4, 1, 0), Position = UDim2.new((i - 1) / n, (i - 1) * 4 / n, 0, 0),
+			BackgroundColor3 = def.color or C.btn, TextColor3 = Color3.new(1, 1, 1),
+			Font = Enum.Font.GothamBold, TextSize = 11, Text = isFn and "" or def.text,
+		}, row)
+		corner(btn, 6)
+		Conn.add("GUI", btn.Activated:Connect(function()
+			pcall(def.cb)
+			UI.refresh()
+		end))
+		if isFn then
+			table.insert(page.refreshers, function()
+				local text = def.text()
+				if btn.Text ~= text then btn.Text = text end
+			end)
+		end
+	end
+end
+
+local function addStepper(page, label, get, set, step, minV, maxV, fmt)
+	local row = make("Frame", {
+		Size = UDim2.new(1, -6, 0, 26), BackgroundTransparency = 1, LayoutOrder = nextOrder(page),
+	}, page.frame)
+	make("TextLabel", {
+		Size = UDim2.new(1, -120, 1, 0), BackgroundTransparency = 1, Text = label,
+		TextColor3 = C.sub, Font = Enum.Font.Gotham, TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+	}, row)
+	local function mk(text, xOffset)
+		local b = make("TextButton", {
+			Size = UDim2.fromOffset(26, 22), Position = UDim2.new(1, xOffset, 0.5, -11),
+			BackgroundColor3 = C.btn, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold,
+			TextSize = 14, Text = text,
+		}, row)
+		corner(b, 6)
+		return b
+	end
+	local minus, plus = mk("-", -118), mk("+", -26)
+	local value = make("TextLabel", {
+		Size = UDim2.fromOffset(60, 22), Position = UDim2.new(1, -90, 0.5, -11),
+		BackgroundTransparency = 1, Text = "", TextColor3 = C.text, Font = Enum.Font.GothamBold,
+		TextSize = 12,
+	}, row)
+	Conn.add("GUI", minus.Activated:Connect(function()
+		set(math.clamp(get() - step, minV, maxV))
+		UI.refresh()
+	end))
+	Conn.add("GUI", plus.Activated:Connect(function()
+		set(math.clamp(get() + step, minV, maxV))
+		UI.refresh()
+	end))
+	table.insert(page.refreshers, function()
+		local text = string.format(fmt, get())
+		if value.Text ~= text then value.Text = text end
+	end)
+end
+
+local function setupDrag(handle, target)
+	local dragging, dragStart, startPos, moveConn = false, nil, nil, nil
+	Conn.add("GUI", handle.InputBegan:Connect(function(input)
+		local kind = input.UserInputType
+		if kind ~= Enum.UserInputType.MouseButton1 and kind ~= Enum.UserInputType.Touch then return end
+		dragging = true
+		dragStart = input.Position
+		startPos = target.Position
+		if moveConn then Conn.remove("Drag", moveConn) end
+		moveConn = Conn.add("Drag", UserInputService.InputChanged:Connect(function(i)
+			if not dragging then return end
+			if i.UserInputType ~= Enum.UserInputType.MouseMovement and i.UserInputType ~= Enum.UserInputType.Touch then
+				return
+			end
+			local delta = i.Position - dragStart
+			local vp = GUI and GUI.AbsoluteSize or Vector2.new(800, 600)
+			if vp.X <= 0 or vp.Y <= 0 then vp = Vector2.new(800, 600) end
+			target.Position = UDim2.fromOffset(
+				math.clamp(startPos.X.Offset + delta.X, 0, math.max(0, vp.X - 80)),
+				math.clamp(startPos.Y.Offset + delta.Y, 0, math.max(0, vp.Y - 40))
+			)
+		end))
+		local endConn
+		endConn = Conn.add("Drag", input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+				if moveConn then Conn.remove("Drag", moveConn); moveConn = nil end
+				Conn.remove("Drag", endConn)
+			end
+		end))
+	end))
+end
+
+local function setMinimized(value)
+	UI.minimized = value
+	if Body then Body.Visible = not value end
+	if Main then
+		local camera = Workspace.CurrentCamera
+		local viewport = camera and camera.ViewportSize or Vector2.new(900, 700)
+		local w = math.clamp(math.floor(viewport.X * 0.92), 320, 520)
+		local h = math.clamp(math.floor(viewport.Y * 0.78), 340, 620)
+		Main.Size = value and UDim2.fromOffset(math.min(w, 380), 38) or UDim2.fromOffset(w, h)
+	end
+end
+
+local function selectTab(name)
+	UI.current = name
+	for n, p in pairs(UI.pages) do p.frame.Visible = (n == name) end
+	for n, b in pairs(UI.tabButtons) do b.BackgroundColor3 = (n == name) and C.accent or C.btn end
+	UI.refresh()
+end
+
+local statusDot
+
+function UI.refresh()
+	if not GUI or not GUI.Parent then return end
+	if statusDot then
+		local any = Core.alive and Gr.enabled and Fx.enabled and Mem.enabled and Perf.enabled
+		local warning = #collectWarnings() > 0
+		statusDot.TextColor3 = warning and C.warn or (any and C.on or C.off)
+	end
+	if UI.minimized then return end
+	local page = UI.pages[UI.current]
+	if page then
+		for _, fn in ipairs(page.refreshers) do pcall(fn) end
+	end
+end
+
+local function graphicsStatusText()
+	if not Gr.enabled then
+		return Restore.pending() > 0 and "OFF (restoring...)" or "OFF"
+	end
+	return CFG.SafeMode and "ON - Safe" or "ON - Aggressive"
+end
+
+local function effectsStatusText()
+	if not Fx.enabled then return "OFF" end
+	local mode = Fx.reduce and "Reducing" or "Monitor only"
+	return "ON - " .. mode .. (CFG.SafeMode and " (Safe)" or "")
+end
+
+local function luaMemText()
+	local kb = readLuaKB()
+	if not kb then return "Unavailable" end
+	return string.format("%.1f MB", kb / 1024)
+end
+
+local function buildGui()
+	GUI = make("ScreenGui", {
+		Name = "SuperOptimizerV30", ResetOnSpawn = false, IgnoreGuiInset = true,
+		DisplayOrder = 999, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	}, PlayerGui)
+
+	local camera = Workspace.CurrentCamera
+	local viewport = camera and camera.ViewportSize or Vector2.new(900, 700)
+	local panelWidth = math.clamp(math.floor(viewport.X * 0.92), 320, 520)
+	local panelHeight = math.clamp(math.floor(viewport.Y * 0.78), 340, 620)
+	Main = make("Frame", {
+		Size = UDim2.fromOffset(panelWidth, panelHeight), Position = UDim2.fromOffset(16, 48),
+		BackgroundColor3 = C.bg, BorderSizePixel = 0, ClipsDescendants = true,
+	}, GUI)
+	corner(Main, 12)
+	make("UIStroke", { Color = Color3.fromRGB(55, 62, 88), Thickness = 1 }, Main)
+
+	-- Header (kéo thả)
+	local header = make("Frame", {
+		Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = C.panel, BorderSizePixel = 0,
+	}, Main)
+	statusDot = make("TextLabel", {
+		Size = UDim2.fromOffset(18, 34), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1,
+		Text = "●", TextColor3 = C.off, Font = Enum.Font.GothamBold, TextSize = 14,
+	}, header)
+	make("TextLabel", {
+		Size = UDim2.new(1, -90, 1, 0), Position = UDim2.fromOffset(30, 0), BackgroundTransparency = 1,
+		Text = "SUPER OPTIMIZER V3.0", TextColor3 = C.text, Font = Enum.Font.GothamBold, TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, header)
+	local minBtn = make("TextButton", {
+		Size = UDim2.fromOffset(30, 24), Position = UDim2.new(1, -38, 0.5, -12),
+		BackgroundColor3 = C.btn, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold,
+		TextSize = 16, Text = "-",
+	}, header)
+	corner(minBtn, 6)
+	Conn.add("GUI", minBtn.Activated:Connect(function()
+		setMinimized(not UI.minimized)
+		minBtn.Text = UI.minimized and "+" or "-"
+		UI.refresh()
+	end))
+	setupDrag(header, Main)
+
+	Body = make("Frame", {
+		Size = UDim2.new(1, 0, 1, -34), Position = UDim2.fromOffset(0, 34), BackgroundTransparency = 1,
+	}, Main)
+
+	-- Thanh tab
+	local tabBar = make("Frame", {
+		Size = UDim2.new(1, -12, 0, 26), Position = UDim2.fromOffset(6, 4), BackgroundTransparency = 1,
+	}, Body)
+	local names = { "Dashboard", "Graphics", "Effects", "Memory", "Performance", "Settings" }
+	for i, name in ipairs(names) do
+		local b = make("TextButton", {
+			Size = UDim2.new(1 / #names, -3, 1, 0), Position = UDim2.new((i - 1) / #names, 0, 0, 0),
+			BackgroundColor3 = C.btn, TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold,
+			TextScaled = true, Text = name,
+		}, tabBar)
+		make("UITextSizeConstraint", { MaxTextSize = 11, MinTextSize = 7 }, b)
+		corner(b, 6)
+		UI.tabButtons[name] = b
+		Conn.add("GUI", b.Activated:Connect(function() selectTab(name) end))
+	end
+
+	local holder = make("Frame", {
+		Size = UDim2.new(1, -12, 1, -38), Position = UDim2.fromOffset(6, 34), BackgroundTransparency = 1,
+	}, Body)
+
+	----------------------------------------------------------------
+	-- DASHBOARD
+	----------------------------------------------------------------
+	local dash = newPage("Dashboard", holder)
+	addHeader(dash, "STATUS")
+	addRow(dash, "Graphics Status", graphicsStatusText)
+	addRow(dash, "Effects Status", effectsStatusText)
+	addRow(dash, "Lua Memory", function()
+		return luaMemText() .. (Mem.enabled and (" - " .. Mem.state) or "")
+	end)
+	addRow(dash, "Current Effect Count", function()
+		if not Fx.enabled then return "-" end
+		return Fx.baseline and tostring(Fx.liveTotal) or "scanning..."
+	end)
+	addRow(dash, "Effect Growth", function()
+		if not (Fx.enabled and Fx.baseline) then return "-" end
+		return string.format("%+d (%+.0f/min)", Fx.liveTotal - Fx.baseline, Fx.rate)
+	end)
+	addRow(dash, "Script Connections", function()
+		return string.format("%d (tasks %d)", Conn.n, Tasks.alive)
+	end)
+	addRow(dash, "Warning Status", function()
+		local w = collectWarnings()
+		return #w == 0 and "OK" or table.concat(w, "; ")
+	end, function()
+		return #collectWarnings() == 0 and C.on or C.warn
+	end)
+	addNote(dash, "AUTO-START: Graphics, Effects, Memory và Performance luôn ON khi script hoạt động. Chỉ UNLOAD mới dừng và khôi phục thiết lập.")
+	addButtons(dash, {
+		{ text = function() return "SAFE MODE: " .. (CFG.SafeMode and "ON" or "OFF") end,
+			cb = function() Core.setSafe(not CFG.SafeMode) end },
+	})
+	addButtons(dash, {
+		{ text = "MINIMIZE GUI", cb = function()
+			setMinimized(true)
+			local btn = header:FindFirstChildOfClass("TextButton")
+			if btn then btn.Text = "+" end
+		end },
+	})
+
+	----------------------------------------------------------------
+	-- GRAPHICS
+	----------------------------------------------------------------
+	local gp = newPage("Graphics", holder)
+	addRow(gp, "Module status", function() return Gr.enabled and "ON (AUTO-START)" or "STOPPED" end)
+	addRow(gp, "Mode", function() return CFG.SafeMode and "Safe" or "Aggressive" end)
+	addRow(gp, "Modified objects (approx)", function() return Restore.counts.Graphics or 0 end)
+	addRow(gp, "Restore pending", function() return Restore.pending() end)
+	addNote(gp, "Safe: GlobalShadows, CastShadow, PostEffect (Bloom/Blur/...), terrain decoration, sóng nước. Aggressive thêm: Material=SmoothPlastic, Reflectance=0, ánh sáng môi trường, QualityLevel (nếu client cho phép). Không Destroy đối tượng, không đụng Transparency/Collision. Không thể tắt hẳn 3D renderer.")
+
+	----------------------------------------------------------------
+	-- EFFECTS
+	----------------------------------------------------------------
+	local ep = newPage("Effects", holder)
+	addRow(ep, "Module status", function() return Fx.enabled and "ON (AUTO-START)" or "STOPPED" end)
+	addRow(ep, "Effect reduction", function() return Fx.reduce and "ON (LOCKED)" or "OFF" end)
+	addHeader(ep, "LIVE COUNT")
+	for _, c in ipairs(EFFECT_BASES) do
+		addRow(ep, c, function() return Fx.enabled and Fx.live[c] or "-" end)
+	end
+	addHeader(ep, "ANALYSIS")
+	addRow(ep, "Total now / baseline", function()
+		if not (Fx.enabled and Fx.baseline) then return "-" end
+		return Fx.liveTotal .. " / " .. Fx.baseline
+	end)
+	addRow(ep, "Growth rate", function()
+		return Fx.enabled and string.format("%+.0f/min", Fx.rate) or "-"
+	end, function() return Fx.warn and C.warn or C.text end)
+	addRow(ep, "Created / Removed (events)", function()
+		return Fx.enabled and (Fx.created .. " / " .. Fx.removed) or "-"
+	end)
+	addRow(ep, "Reduced by script (total)", function() return Fx.enabled and Fx.processed or "-" end)
+	addRow(ep, "Found by recheck", function() return Fx.enabled and Fx.reconciled or "-" end)
+	addRow(ep, "Lingering suspects", function()
+		if not Fx.enabled then return "-" end
+		return Fx.lingering and tostring(Fx.lingering) or Fx.lingerState
+	end)
+	addNote(ep, "Safe Mode bỏ qua Beam/Trail và hiệu ứng trong model có Humanoid. PostEffect chỉ bị tắt bởi Graphics. Số hiệu ứng tăng KHÔNG đồng nghĩa memory leak: hãy đối chiếu với tab Memory.")
+
+	----------------------------------------------------------------
+	-- MEMORY
+	----------------------------------------------------------------
+	local mp = newPage("Memory", holder)
+	addRow(mp, "Module status", function() return Mem.enabled and "ON (AUTO-START)" or "STOPPED" end)
+	addRow(mp, "Lua memory", luaMemText)
+	addRow(mp, "Client total (Stats)", function()
+		return Mem.engineMB and string.format("%.0f MB", Mem.engineMB) or "N/A"
+	end)
+	addRow(mp, "Trend", function() return Mem.state end, function()
+		return Mem.state == "Rising (sustained)" and C.warn or C.text
+	end)
+	addRow(mp, "Detail", function() return Mem.detail end)
+	addRow(mp, "Samples", function() return #Mem.kb .. "/" .. CFG.MemoryHistory end)
+	addRow(mp, "Script connections", function() return Conn.n end)
+	addRow(mp, "Script tasks alive", function() return Tasks.alive end)
+	addRow(mp, "Tracked effects (refs)", function() return Fx.enabled and Fx.liveTotal or 0 end)
+	addButtons(mp, { { text = "MANUAL GC TEST (1 lần)", cb = Mem.manualGC } })
+	addRow(mp, "GC result", function() return Mem.gcResult end)
+	addNote(mp, "Lua heap chỉ đo được nếu Delta cung cấp collectgarbage; Client total dùng Stats nếu được hỗ trợ. Không phải toàn bộ RAM thiết bị. Script không tự gọi GC. Rising (sustained) = đáy sau GC tăng dần liên tục >= 3 phút.")
+
+	----------------------------------------------------------------
+	-- PERFORMANCE
+	----------------------------------------------------------------
+	local pp = newPage("Performance", holder)
+	addRow(pp, "Module status", function() return Perf.enabled and "ON (AUTO-START)" or "STOPPED" end)
+	addRow(pp, "FPS", function() return Perf.enabled and string.format("%.0f", Perf.fps) or "-" end)
+	addRow(pp, "Script CPU (self-measured)", function()
+		return Perf.enabled and string.format("%.2f ms/s", Perf.selfMsPerSec) or "-"
+	end)
+	addRow(pp, "Descendant events/s", function()
+		return Perf.enabled and string.format("%.0f", Perf.eventsPerSec) or "-"
+	end)
+	addRow(pp, "Queue size", function() return Queue.size() end)
+	addRow(pp, "Queue dropped", function() return Queue.dropped end)
+	addRow(pp, "Scan progress", function()
+		if not Scan.active then return "idle" end
+		return string.format("%.0f%%", Scan.total > 0 and Scan.done / Scan.total * 100 or 0)
+	end)
+	addRow(pp, "Restore pending", function() return Restore.pending() end)
+	addRow(pp, "Worker (Heartbeat)", function() return Worker.conn and "running" or "idle" end)
+	addNote(pp, "Worker chỉ tồn tại khi còn việc và tự ngắt khi rảnh. Số liệu CPU là tự đo bằng os.clock, chỉ mang tính tham khảo - cần benchmark bằng MicroProfiler để kết luận.")
+
+	----------------------------------------------------------------
+	-- SETTINGS
+	----------------------------------------------------------------
+	local sp = newPage("Settings", holder)
+	addButtons(sp, {
+		{ text = function() return "SAFE MODE: " .. (CFG.SafeMode and "ON" or "OFF") end,
+			cb = function() Core.setSafe(not CFG.SafeMode) end },
+	})
+	addStepper(sp, "Frame budget (ms)", function() return CFG.BudgetMs end,
+		function(v) CFG.BudgetMs = v end, 0.5, 0.5, 4, "%.1f")
+	addStepper(sp, "Growth warn (/min)", function() return CFG.EffectGrowthWarnPerMin end,
+		function(v) CFG.EffectGrowthWarnPerMin = v end, 30, 30, 600, "%.0f")
+	addStepper(sp, "Memory sample (s)", function() return CFG.MemorySampleSec end,
+		function(v) CFG.MemorySampleSec = v end, 1, 2, 30, "%.0f")
+	addButtons(sp, { { text = "UNLOAD (restore + remove GUI)", cb = Core.unload, color = C.warn } })
+	addNote(sp, "Các module tự chạy và luôn ON; chỉ UNLOAD mới dừng. Phím RightControl: ẩn/hiện GUI. Kéo thanh tiêu đề để di chuyển. Đổi Memory sample áp dụng từ lần đo kế tiếp.")
+
+	-- GUI bị xóa từ bên ngoài -> khôi phục và dọn dẹp
+	Conn.add("GUI", GUI.AncestryChanged:Connect(function()
+		if not GUI.Parent then Core.unload() end
+	end))
+
+	Conn.add("GUI", UserInputService.InputBegan:Connect(function(input, processed)
+		if processed then return end
+		if input.KeyCode == Enum.KeyCode.RightControl then
+			GUI.Enabled = not GUI.Enabled
+		end
+	end))
+
+	selectTab("Dashboard")
+end
+
+--==============================================================
+-- 18. TICKER (MỘT vòng lặp duy nhất, luôn có task.wait)
+--==============================================================
+local function tickerLoop()
+	local last = { mem = 0, fx = 0, rescan = os.clock() }
+	while Core.alive do
+		task.wait(CFG.TickInterval)
+		if not Core.alive then break end
+		local now = os.clock()
+
+		if Mem.enabled and now - last.mem >= CFG.MemorySampleSec then
+			last.mem = now
+			pcall(Mem.sample)
+		end
+		if Fx.enabled and now - last.fx >= CFG.EffectSampleSec then
+			last.fx = now
+			pcall(Fx.analyze)
+		end
+		if Fx.enabled and now - last.rescan >= CFG.RescanSec then
+			last.rescan = now
+			if not Scan.active then pcall(Scan.request) end
+		end
+		if Perf.enabled then pcall(Perf.sample, now) end
+		if GUI and GUI.Enabled then pcall(UI.refresh) end
+
+		Perf.selfTime += os.clock() - now
+	end
+end
+
+--==============================================================
+-- 19. KHỞI CHẠY
+--==============================================================
+local Public = { Version = "3.0", Unload = Core.unload, Core = Core,
+	Gr = Gr, Fx = Fx, Mem = Mem, Perf = Perf, CFG = CFG }
+pcall(function() shared.RobloxSuperOptimizer = Public end)
+
+local okGui, errGui = pcall(buildGui)
+if not okGui then
+	warn("[SuperOptimizer V3.0] Lỗi tạo GUI: " .. tostring(errGui))
+	Core.unload()
+	return
+end
+
+-- AUTO-START: bật toàn bộ module sau khi GUI tạo thành công.
+Core.enableAll()
+Tasks.spawn("Ticker", tickerLoop)
+UI.refresh()
+print("[SuperOptimizer V3.0] Loaded. Auto-start: Graphics / Effects / Memory / Performance = ON. RightControl: ẩn/hiện GUI.")
