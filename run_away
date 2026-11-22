@@ -3,7 +3,7 @@ local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
 local idleLimit = 300 -- Số giây không di chuyển trước khi tự thoát
-local moveThreshold = 0.1 -- Ngưỡng dịch chuyển tối thiểu (studs)
+local moveThreshold = 5 -- Ngưỡng dịch chuyển tối thiểu (studs)
 
 local idleTime = 0
 local lastPos = nil
