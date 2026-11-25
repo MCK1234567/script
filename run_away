@@ -28,7 +28,7 @@ RunService.Heartbeat:Connect(function(dt)
             pcall(function()
                 game:Shutdown()
             end)
-            player:Kick("Bạn đã đứng yên quá lâu!")
+            player:Kick("Chạy cmm đii!")
         end
     end
 end)
