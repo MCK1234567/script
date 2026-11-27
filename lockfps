@@ -2,7 +2,7 @@
 if setfpscap then
     setfpscap(15)
 else
-    warn("Executor does not support setfpscap!")
+    warn("Tao đình công")
 end
 
 --// SERVICES
