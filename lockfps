@@ -1,5 +1,50 @@
+--// FPS CAP
 if setfpscap then
-    setfpscap(15) -- Change this value to your desired FPS
+    setfpscap(15)
 else
     warn("Executor does not support setfpscap!")
 end
+
+--// SERVICES
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+
+local player = Players.LocalPlayer
+
+--// GUI
+local gui = Instance.new("ScreenGui")
+gui.Name = "FPSCounter"
+gui.ResetOnSpawn = false
+
+local label = Instance.new("TextLabel")
+label.Size = UDim2.new(0, 130, 0, 28)
+
+-- Góc dưới bên trái
+label.AnchorPoint = Vector2.new(0, 1)
+label.Position = UDim2.new(0, 10, 1, -10)
+
+label.BackgroundTransparency = 0.3
+label.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+label.TextColor3 = Color3.fromRGB(0, 255, 0)
+label.TextSize = 16
+label.Font = Enum.Font.GothamBold
+label.Text = "FPS: ..."
+label.Parent = gui
+
+gui.Parent = player:WaitForChild("PlayerGui")
+
+--// FPS UPDATE
+local frames = 0
+local elapsed = 0
+
+RunService.RenderStepped:Connect(function(dt)
+    frames += 1
+    elapsed += dt
+
+    if elapsed >= 1 then
+        label.Text = "FPS: " .. math.floor(frames / elapsed)
+
+        frames = 0
+        elapsed = 0
+    end
+end)
